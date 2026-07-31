@@ -9,7 +9,6 @@
 #include <atomic>
 #include <mutex>
 #include <algorithm>
-#include <cmath>
 #include <sstream>
 
 struct hitBox {
@@ -24,6 +23,29 @@ struct RenderLine {
     int numH = 0;
     int contentW = 0;
     int contentH = 0;
+};
+
+struct FileNode {
+    std::string name;
+    std::string path;
+    bool isDirectory = false;
+    bool isExpanded = false;
+    bool isLoaded = false;
+    std::vector<std::unique_ptr<FileNode>> children;
+    TTF_Text* textRender = nullptr;
+    int w = 0;
+    int h = 0;
+
+    ~FileNode() {
+        if (textRender) {
+            TTF_DestroyText(textRender);
+        }
+    }
+};
+
+struct EnumData {
+    std::vector<std::unique_ptr<FileNode>> dirs;
+    std::vector<std::unique_ptr<FileNode>> files;
 };
 
 class Editor {
@@ -77,6 +99,28 @@ private:
 
     int _cursorLine = 0;
     int _cursorCol = 0;
+
+    bool _isDirty = false;
+    std::atomic<bool> _isFolderReady{false};
+    std::mutex _folderMutex;
+    std::string _pendingFolderPath;
+    std::string _currentFolderPath = "";
+
+    // Directory Tree Rendering state
+    std::unique_ptr<FileNode> _rootFolder;
+    std::vector<FileNode*> _visibleNodes;
+    std::vector<int> _visibleNodeDepths;
+    
+    float _sideScrollOffsetY = 0.0f;
+    float _sideScrollOffsetX = 0.0f;
+    SDL_FRect _sideVThumb = {0, 0, 0, 0};
+    SDL_FRect _sideHThumb = {0, 0, 0, 0};
+    bool _isDraggingSideV = false;
+    bool _isDraggingSideH = false;
+    float _dragSideOffsetY = 0.0f;
+    float _dragSideOffsetX = 0.0f;
+    int _sideTextHeight = 0;
+    int _sideTextWidth = 0;
 
 public:
     Editor() {
@@ -148,7 +192,20 @@ public:
                     _isSaveReady = false;
                 }
                 _currentFilePath = pathToSave;
-                saveFile(); 
+                if(_isDirty)
+                    saveFile(); 
+                _change = true;
+                _isDirty = false;
+            }
+
+            if(_isFolderReady) {
+                std::string folderToLoad;
+                {
+                    std::lock_guard<std::mutex> lock(_folderMutex);
+                    folderToLoad = _pendingFolderPath;
+                    _isFolderReady = false;
+                }
+                processFolderLoad(folderToLoad);
                 _change = true;
             }
 
@@ -170,6 +227,7 @@ public:
     }
 
     ~Editor() {
+        _rootFolder.reset(); // Safely destroy folder tree layout and SDL Text renders before the Text Engine
         clearRenderLines();
         if (_textEngine) TTF_DestroyRendererTextEngine(_textEngine);
         if (_font) TTF_CloseFont(_font);
@@ -200,13 +258,22 @@ private:
         }
         else if (event.type == SDL_EVENT_WINDOW_RESIZED) {
             updateDimensionsOnResize();
-            clampAndUpdateScrollbars();
             _change = true;
         }
         else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
-            _scrollOffsetY -= event.wheel.y * 40.0f;
-            _scrollOffsetX -= event.wheel.x * 40.0f;
-            clampAndUpdateScrollbars();
+            float mouseX, mouseY;
+            SDL_GetMouseState(&mouseX, &mouseY);
+            SDL_FPoint p = {mouseX, mouseY};
+            
+            if (SDL_PointInRectFloat(&p, &_sideBar)) {
+                _sideScrollOffsetY -= event.wheel.y * 40.0f;
+                _sideScrollOffsetX -= event.wheel.x * 40.0f;
+                clampSideScrollbars();
+            } else {
+                _scrollOffsetY -= event.wheel.y * 40.0f;
+                _scrollOffsetX -= event.wheel.x * 40.0f;
+                clampAndUpdateScrollbars();
+            }
             _change = true;
         }
         else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
@@ -218,6 +285,8 @@ private:
             if (event.button.button == SDL_BUTTON_LEFT) {
                 _isDraggingV = false;
                 _isDraggingH = false;
+                _isDraggingSideV = false;
+                _isDraggingSideH = false;
                 _isSelectingText = false;
                 _change = true;
             }
@@ -235,6 +304,7 @@ private:
         updateSingleRenderLine(_cursorLine);
         forceCursorVisible();
         _change = true;
+        _isDirty = true;
     }
 
     void handleKeyDown(const SDL_KeyboardEvent& key) {
@@ -251,6 +321,7 @@ private:
         }
         else if (ctrlPressed && key.key == SDLK_S) {
             saveFile();
+            _isDirty = false;
         }
         else if (ctrlPressed && key.key == SDLK_A){
             selectAllText();
@@ -333,6 +404,7 @@ private:
         }
         forceCursorVisible();
         _change = true;
+        _isDirty = true;
     }
 
     void handleEnter() {
@@ -350,6 +422,7 @@ private:
         updateTextDisplay();
         forceCursorVisible();
         _change = true;
+        _isDirty = true;
     }
 
     void handlePaste() {
@@ -394,6 +467,7 @@ private:
 
         forceCursorVisible();
         _change = true;
+        _isDirty = true;
     }
 
     void saveFile() {
@@ -465,15 +539,31 @@ private:
 
     void handleMouseClick(float mouseX, float mouseY) {
         SDL_FPoint clickPoint = { mouseX, mouseY };
+        float displayW = _textArea.w - SCROLLBAR_SIZE;
+        float displayH = _textArea.h - SCROLLBAR_SIZE;
 
-        if (SDL_PointInRectFloat(&clickPoint, &_vThumb)) {
+        if (_textHeight > displayH - 10.0f && SDL_PointInRectFloat(&clickPoint, &_vThumb)) {
             _isDraggingV = true;
             _dragOffsetY = mouseY - _vThumb.y;
             return;
         }
-        if (SDL_PointInRectFloat(&clickPoint, &_hThumb)) {
+        if (_textWidth > displayW - 10.0f && SDL_PointInRectFloat(&clickPoint, &_hThumb)) {
             _isDraggingH = true;
             _dragOffsetX = mouseX - _hThumb.x;
+            return;
+        }
+
+        float sideDisplayW = _sideBar.w - SCROLLBAR_SIZE;
+        float sideDisplayH = _sideBar.h - SCROLLBAR_SIZE;
+
+        if (_sideTextHeight > sideDisplayH - 10.0f && SDL_PointInRectFloat(&clickPoint, &_sideVThumb)) {
+            _isDraggingSideV = true;
+            _dragSideOffsetY = mouseY - _sideVThumb.y;
+            return;
+        }
+        if (_sideTextWidth > sideDisplayW - 10.0f && SDL_PointInRectFloat(&clickPoint, &_sideHThumb)) {
+            _isDraggingSideH = true;
+            _dragSideOffsetX = mouseX - _sideHThumb.x;
             return;
         }
 
@@ -483,7 +573,50 @@ private:
                     SDL_ShowOpenFileDialog(Editor::loadFileCallback, this, _window, nullptr, 0, nullptr, false);
                     return; 
                 }
+                else if(hb.name == "FolderText") {
+                    SDL_ShowOpenFolderDialog(Editor::loadFolderCallback, this, _window, nullptr, false);
+                    return; 
+                }
+                else if(hb.name == "NewText") {
+                    if(_isDirty){
+                        saveFile();
+                    }
+                    _fileContent.clear();
+                    _fileContent.push_back("");
+                    _cursorLine = 0;
+                    _cursorCol = 0;
+                    clearSelection();
+                    updateTextDisplay();
+                    _currentFilePath = "";
+                    _change = true;
+                    _isDirty = false;
+                    return; 
+                }
             }
+        }
+
+        if (SDL_PointInRectFloat(&clickPoint, &_sideBar)) {
+            int lineHeight = TTF_GetFontHeight(_font);
+            if (lineHeight <= 0) lineHeight = 24;
+
+            float relativeY = mouseY - (_sideBar.y + 5.0f) + _sideScrollOffsetY;
+            int clickedIndex = (int)(relativeY / lineHeight);
+
+            if (clickedIndex >= 0 && clickedIndex < _visibleNodes.size()) {
+                FileNode* n = _visibleNodes[clickedIndex];
+                if (n->isDirectory) {
+                    n->isExpanded = !n->isExpanded;
+                    if (n->isExpanded && !n->isLoaded) {
+                        loadDirectoryContents(n);
+                    }
+                    updateNodeText(n);
+                    updateFolderView();
+                } else {
+                    processFileLoad(n->path);
+                }
+                _change = true;
+            }
+            return;
         }
 
         if (SDL_PointInRectFloat(&clickPoint, &_textArea)) {
@@ -529,6 +662,31 @@ private:
             _change = true;
         }
 
+        if (_isDraggingSideV || _isDraggingSideH) {
+            float displayW = _sideBar.w - SCROLLBAR_SIZE;
+            float displayH = _sideBar.h - SCROLLBAR_SIZE;
+            
+            float maxScrollY = std::max(0.0f, (float)_sideTextHeight - displayH + 10.0f);
+            float maxScrollX = std::max(0.0f, (float)_sideTextWidth - displayW + 10.0f);
+
+            if (_isDraggingSideV && maxScrollY > 0) {
+                float maxThumbY = displayH - _sideVThumb.h;
+                float newThumbY = mouseY - _dragSideOffsetY - _sideBar.y;
+                newThumbY = std::clamp(newThumbY, 0.0f, maxThumbY);
+                _sideScrollOffsetY = (newThumbY / maxThumbY) * maxScrollY;
+            }
+
+            if (_isDraggingSideH && maxScrollX > 0) {
+                float maxThumbX = displayW - _sideHThumb.w;
+                float newThumbX = mouseX - _dragSideOffsetX - _sideBar.x;
+                newThumbX = std::clamp(newThumbX, 0.0f, maxThumbX);
+                _sideScrollOffsetX = (newThumbX / maxThumbX) * maxScrollX;
+            }
+
+            clampSideScrollbars();
+            _change = true;
+        }
+
         if (_isSelectingText) {
             getLineAndColFromMouse(mouseX, mouseY, _selEndLine, _selEndCol);
             _cursorLine = _selEndLine;
@@ -571,6 +729,39 @@ private:
         _hThumb.h = SCROLLBAR_SIZE;
     }
 
+    void clampSideScrollbars() {
+        float displayW = _sideBar.w - SCROLLBAR_SIZE;
+        float displayH = _sideBar.h - SCROLLBAR_SIZE;
+
+        float maxScrollX = std::max(0.0f, (float)_sideTextWidth - displayW + 10.0f);
+        float maxScrollY = std::max(0.0f, (float)_sideTextHeight - displayH + 10.0f);
+
+        _sideScrollOffsetX = std::clamp(_sideScrollOffsetX, 0.0f, maxScrollX);
+        _sideScrollOffsetY = std::clamp(_sideScrollOffsetY, 0.0f, maxScrollY);
+
+        if (_sideTextHeight > displayH - 10.0f && _sideTextHeight > 0) {
+            _sideVThumb.h = std::max(20.0f, displayH * (displayH / _sideTextHeight));
+            float maxThumbY = displayH - _sideVThumb.h;
+            _sideVThumb.y = _sideBar.y + (_sideScrollOffsetY / maxScrollY) * maxThumbY;
+        } else {
+            _sideVThumb.h = displayH;
+            _sideVThumb.y = _sideBar.y;
+        }
+        _sideVThumb.x = _sideBar.x + displayW;
+        _sideVThumb.w = SCROLLBAR_SIZE;
+
+        if (_sideTextWidth > displayW - 10.0f && _sideTextWidth > 0) {
+            _sideHThumb.w = std::max(20.0f, displayW * (displayW / _sideTextWidth));
+            float maxThumbX = displayW - _sideHThumb.w;
+            _sideHThumb.x = _sideBar.x + (_sideScrollOffsetX / maxScrollX) * maxThumbX;
+        } else {
+            _sideHThumb.w = displayW;
+            _sideHThumb.x = _sideBar.x;
+        }
+        _sideHThumb.y = _sideBar.y + displayH;
+        _sideHThumb.h = SCROLLBAR_SIZE;
+    }
+
     void updateDimensionsOnResize() {
         SDL_Rect displayBounds;
         SDL_GetWindowSize(_window, &displayBounds.w, &displayBounds.h);
@@ -583,6 +774,127 @@ private:
         _textArea = { (float)_width * 0.2f, 40.0f, (float)_width * 0.8f, (float)_height - 40.0f };
 
         updateHitboxes();
+        clampAndUpdateScrollbars();
+        clampSideScrollbars();
+    }
+
+    void loadDirectoryContents(FileNode* node) {
+        if (!node || !node->isDirectory) return;
+        node->children.clear();
+
+        EnumData data;
+        if (!SDL_EnumerateDirectory(node->path.c_str(), DirEnumCallback, &data)) {
+            SDL_Log("FS error: %s", SDL_GetError());
+        }
+
+        auto sortFunc = [](const std::unique_ptr<FileNode>& a, const std::unique_ptr<FileNode>& b) {
+            std::string nameA = a->name;
+            std::string nameB = b->name;
+            for(auto& c : nameA) c = std::tolower(static_cast<unsigned char>(c));
+            for(auto& c : nameB) c = std::tolower(static_cast<unsigned char>(c));
+            return nameA < nameB;
+        };
+
+        std::sort(data.dirs.begin(), data.dirs.end(), sortFunc);
+        std::sort(data.files.begin(), data.files.end(), sortFunc);
+        
+        for(auto& d : data.dirs) node->children.push_back(std::move(d));
+        for(auto& f : data.files) node->children.push_back(std::move(f));
+        
+        node->isLoaded = true;
+    }
+
+    void updateNodeText(FileNode* n) {
+        if (n->textRender) {
+            TTF_DestroyText(n->textRender);
+            n->textRender = nullptr;
+        }
+        std::string prefix = n->isDirectory ? (n->isExpanded ? "v " : "> ") : "  ";
+        std::string displayText = prefix + n->name;
+        
+        n->textRender = TTF_CreateText(_textEngine, _font, displayText.c_str(), displayText.length());
+        if (n->textRender) {
+            TTF_GetTextSize(n->textRender, &n->w, &n->h);
+            if (n->isDirectory) {
+                TTF_SetTextColor(n->textRender, 100, 200, 255, 255);  
+            } else {
+                TTF_SetTextColor(n->textRender, 200, 200, 200, 255); 
+            }
+        }
+    }
+
+    void flattenTree(FileNode* node, int depth) {
+        if (!node) return;
+        _visibleNodes.push_back(node);
+        _visibleNodeDepths.push_back(depth);
+        if (node->isExpanded) {
+            for (auto& child : node->children) {
+                flattenTree(child.get(), depth + 1);
+            }
+        }
+    }
+
+    void updateFolderView() {
+        _visibleNodes.clear();
+        _visibleNodeDepths.clear();
+        
+        if (_rootFolder) {
+            flattenTree(_rootFolder.get(), 0);
+        }
+        
+        int lineHeight = TTF_GetFontHeight(_font);
+        if (lineHeight <= 0) lineHeight = 24;
+        
+        _sideTextHeight = _visibleNodes.size() * lineHeight;
+        _sideTextWidth = 0;
+        
+        for (size_t i = 0; i < _visibleNodes.size(); i++) {
+            FileNode* n = _visibleNodes[i];
+            if (!n->textRender) {
+                updateNodeText(n);
+            }
+            int itemW = n->w + (_visibleNodeDepths[i] * 15) + 20;
+            if (itemW > _sideTextWidth) {
+                _sideTextWidth = itemW;
+            }
+        }
+        clampSideScrollbars();
+    }
+
+    void processFolderLoad(const std::string& folderPath) {
+        _currentFolderPath = folderPath;
+        _rootFolder = std::make_unique<FileNode>();
+        _rootFolder->path = folderPath;
+        
+        std::string cleanPath = folderPath;
+        while (!cleanPath.empty() && (cleanPath.back() == '/' || cleanPath.back() == '\\')) {
+            cleanPath.pop_back();
+        }
+        
+        size_t lastSlash = cleanPath.find_last_of("/\\");
+        if (lastSlash != std::string::npos) {
+            _rootFolder->name = cleanPath.substr(lastSlash + 1);
+        } else {
+            _rootFolder->name = cleanPath.empty() ? folderPath : cleanPath; 
+        }
+        
+        _rootFolder->isDirectory = true;
+        _rootFolder->isExpanded = true;
+        
+        loadDirectoryContents(_rootFolder.get());
+        updateFolderView();
+        
+        _fileContent.clear();
+        _fileContent.push_back("");
+        updateTextDisplay();
+        
+        _cursorLine = 0;
+        _cursorCol = 0;
+        clearSelection();
+        
+        _sideScrollOffsetX = 0.0f;
+        _sideScrollOffsetY = 0.0f;
+        _change = true;
     }
 
     void updateHitboxes() {
@@ -599,6 +911,28 @@ private:
         fileButton.name = "FileText";
         fileButton.box = { 0.0f, 0.0f, (float)textW, (float)textH };
         _hitBoxes.push_back(fileButton);
+
+        fileText = TTF_CreateText(_textEngine, _font, "Folder", 6);
+        if (fileText) {
+            TTF_GetTextSize(fileText, &textW, &textH);
+            TTF_DestroyText(fileText);
+        }
+
+        hitBox folderButton;
+        folderButton.name = "FolderText";
+        folderButton.box = { (float)(fileButton.box.x + fileButton.box.w + 10), 0.0f, (float)textW, (float)textH };
+        _hitBoxes.push_back(folderButton);
+
+        fileText = TTF_CreateText(_textEngine, _font, "New", 3);
+        if (fileText) {
+            TTF_GetTextSize(fileText, &textW, &textH);
+            TTF_DestroyText(fileText);
+        }
+
+        hitBox newButton;
+        newButton.name = "NewText";
+        newButton.box = { (float)(folderButton.box.x + folderButton.box.w + 10), 0.0f, (float)textW, (float)textH };
+        _hitBoxes.push_back(newButton);
     }
 
     void drawLayout() {
@@ -614,7 +948,19 @@ private:
         TTF_Text* fileOptions = TTF_CreateText(_textEngine, _font, "File", 4);
         if (fileOptions) {
             SDL_SetRenderDrawColor(_renderer, 255, 255, 255, 255);
-            TTF_DrawRendererText(fileOptions, 0, 0);
+            TTF_DrawRendererText(fileOptions, _hitBoxes[0].box.x, 0);
+            TTF_DestroyText(fileOptions);
+        }
+        fileOptions = TTF_CreateText(_textEngine, _font, "Folder", 6);
+        if (fileOptions) {
+            SDL_SetRenderDrawColor(_renderer, 255, 255, 255, 255);
+            TTF_DrawRendererText(fileOptions, _hitBoxes[1].box.x, 0);
+            TTF_DestroyText(fileOptions);
+        }
+        fileOptions = TTF_CreateText(_textEngine, _font, "New", 3);
+        if (fileOptions) {
+            SDL_SetRenderDrawColor(_renderer, 255, 255, 255, 255);
+            TTF_DrawRendererText(fileOptions, _hitBoxes[2].box.x, 0);
             TTF_DestroyText(fileOptions);
         }
     }
@@ -622,6 +968,55 @@ private:
     void drawSideBar() {
         SDL_SetRenderDrawColor(_renderer, 30, 30, 30, 255);
         SDL_RenderFillRect(_renderer, &_sideBar);
+
+        float displayW = _sideBar.w - SCROLLBAR_SIZE;
+        float displayH = _sideBar.h - SCROLLBAR_SIZE;
+
+        if (!_visibleNodes.empty()) {
+            SDL_Rect clipRect = {
+                (int)_sideBar.x,
+                (int)_sideBar.y,
+                (int)displayW,
+                (int)displayH
+            };
+            SDL_SetRenderClipRect(_renderer, &clipRect);
+
+            int lineHeight = TTF_GetFontHeight(_font);
+            if (lineHeight <= 0) lineHeight = 24;
+
+            int firstVisibleLine = std::max(0, (int)(_sideScrollOffsetY / lineHeight));
+            int visibleLineCount = std::ceil(clipRect.h / (float)lineHeight) + 1;
+            int lastVisibleLine = std::min((int)_visibleNodes.size(), firstVisibleLine + visibleLineCount);
+
+            for (int i = firstVisibleLine; i < lastVisibleLine; ++i) {
+                float yPos = _sideBar.y + 5.0f - _sideScrollOffsetY + (i * lineHeight);
+                float xPos = _sideBar.x + 5.0f - _sideScrollOffsetX + (_visibleNodeDepths[i] * 15.0f);
+
+                if (_visibleNodes[i]->textRender) {
+                    TTF_DrawRendererText(_visibleNodes[i]->textRender, xPos, yPos);
+                }
+            }
+            SDL_SetRenderClipRect(_renderer, nullptr);
+        }
+
+        SDL_SetRenderDrawColor(_renderer, 40, 40, 40, 255);
+        SDL_FRect vTrack = { _sideBar.x + displayW, _sideBar.y, SCROLLBAR_SIZE, displayH };
+        SDL_FRect hTrack = { _sideBar.x, _sideBar.y + displayH, displayW, SCROLLBAR_SIZE };
+        SDL_FRect corner = { _sideBar.x + displayW, _sideBar.y + displayH, SCROLLBAR_SIZE, SCROLLBAR_SIZE };
+        
+        SDL_RenderFillRect(_renderer, &vTrack);
+        SDL_RenderFillRect(_renderer, &hTrack);
+        SDL_RenderFillRect(_renderer, &corner);
+
+        if (_sideTextWidth > displayW) {
+            SDL_SetRenderDrawColor(_renderer, _isDraggingSideH ? 120 : 80, _isDraggingSideH ? 120 : 80, _isDraggingSideH ? 120 : 80, 255);
+            SDL_RenderFillRect(_renderer, &_sideHThumb);
+        }
+        
+        if (_sideTextHeight > displayH) {
+            SDL_SetRenderDrawColor(_renderer, _isDraggingSideV ? 120 : 80, _isDraggingSideV ? 120 : 80, _isDraggingSideV ? 120 : 80, 255);
+            SDL_RenderFillRect(_renderer, &_sideVThumb);
+        }
     }
 
     void drawTextArea() {
@@ -885,6 +1280,48 @@ private:
         }
         editor->_isSaveReady = true;
     }
+
+    static void SDLCALL loadFolderCallback(void *userData, const char* const* folderList, int filter){
+        if (!folderList || !*folderList) {
+            return;
+        }
+
+        Editor* editor = static_cast<Editor*>(userData);
+        {
+            std::lock_guard<std::mutex> lock(editor->_folderMutex);
+            editor->_pendingFolderPath = *folderList;
+        }
+        editor->_isFolderReady = true;
+    }
+
+static SDL_EnumerationResult SDLCALL DirEnumCallback(void *userdata, const char *dirname, const char *fname) {
+    EnumData* data = static_cast<EnumData*>(userdata);
+
+    std::string fileName = fname;
+    if (fileName == "." || fileName == "..") {
+        return SDL_ENUM_CONTINUE;
+    }
+
+    auto child = std::make_unique<FileNode>();
+
+    child->path = std::string(dirname) + fname;
+    child->name = fileName;
+    
+    SDL_PathInfo info;
+    if (SDL_GetPathInfo(child->path.c_str(), &info)) {
+        child->isDirectory = (info.type == SDL_PATHTYPE_DIRECTORY);
+    } else {
+        child->isDirectory = false;
+    }
+
+    if (child->isDirectory) {
+        data->dirs.push_back(std::move(child));
+    } else {
+        data->files.push_back(std::move(child));
+    }
+
+    return SDL_ENUM_CONTINUE;
+}
 };
 
 int main(int argc, char* argv[]) {
