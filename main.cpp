@@ -106,7 +106,6 @@ private:
     std::string _pendingFolderPath;
     std::string _currentFolderPath = "";
 
-    // Directory Tree Rendering state
     std::unique_ptr<FileNode> _rootFolder;
     std::vector<FileNode*> _visibleNodes;
     std::vector<int> _visibleNodeDepths;
@@ -227,7 +226,7 @@ public:
     }
 
     ~Editor() {
-        _rootFolder.reset(); // Safely destroy folder tree layout and SDL Text renders before the Text Engine
+        _rootFolder.reset(); 
         clearRenderLines();
         if (_textEngine) TTF_DestroyRendererTextEngine(_textEngine);
         if (_font) TTF_CloseFont(_font);
