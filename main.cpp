@@ -10,6 +10,11 @@
 #include <mutex>
 #include <algorithm>
 #include <sstream>
+#include <thread>
+#include <condition_variable>
+#include <llama.h>
+#include <llama-cpp.h>
+#include <cmath>
 
 struct hitBox {
     std::string name;
@@ -25,27 +30,30 @@ struct RenderLine {
     int contentH = 0;
 };
 
-struct FileNode {
+struct Folder {
     std::string name;
     std::string path;
-    bool isDirectory = false;
     bool isExpanded = false;
-    bool isLoaded = false;
-    std::vector<std::unique_ptr<FileNode>> children;
-    TTF_Text* textRender = nullptr;
-    int w = 0;
-    int h = 0;
+    std::vector<Folder*> childFolders;
+    std::vector<std::string> files;
 
-    ~FileNode() {
-        if (textRender) {
-            TTF_DestroyText(textRender);
+    ~Folder() {
+        for (Folder* f : childFolders) {
+            delete f;
         }
+        childFolders.clear();
     }
 };
 
-struct EnumData {
-    std::vector<std::unique_ptr<FileNode>> dirs;
-    std::vector<std::unique_ptr<FileNode>> files;
+struct SideBarItem {
+    bool isFolder;
+    Folder* folderPtr;
+    std::string name;
+    std::string path;
+    int depth;
+    TTF_Text* textRender = nullptr;
+    int w = 0;
+    int h = 0;
 };
 
 class Editor {
@@ -106,9 +114,8 @@ private:
     std::string _pendingFolderPath;
     std::string _currentFolderPath = "";
 
-    std::unique_ptr<FileNode> _rootFolder;
-    std::vector<FileNode*> _visibleNodes;
-    std::vector<int> _visibleNodeDepths;
+    Folder* _rootFolder = nullptr;
+    std::vector<SideBarItem> _sidebarItems;
     
     float _sideScrollOffsetY = 0.0f;
     float _sideScrollOffsetX = 0.0f;
@@ -120,6 +127,24 @@ private:
     float _dragSideOffsetX = 0.0f;
     int _sideTextHeight = 0;
     int _sideTextWidth = 0;
+
+    bool _aiEnabled = false;
+    std::thread _aiThread;
+    std::atomic<bool> _aiThreadRunning{true};
+    std::condition_variable _aiCv;
+    std::mutex _aiWorkerMutex;
+    std::atomic<bool> _pendingAiRequest{false};
+    std::atomic<bool> _cancelGeneration{false};
+    
+    std::string _aiPrefix;
+    std::string _aiSuffix;
+    int _aiReqLine = 0;
+    int _aiReqCol = 0;
+
+    std::mutex _suggestionMutex;
+    std::vector<std::string> _suggestionLines;
+    int _sugCursorLine = -1;
+    int _sugCursorCol = -1;
 
 public:
     Editor() {
@@ -160,12 +185,17 @@ public:
             }
         }
 
+        llama_backend_init();
+
         _fileContent.push_back("");
         updateTextDisplay();
 
         SDL_StartTextInput(_window);
         updateDimensionsOnResize();
         _state = true;
+        _isDirty = false;
+
+        _aiThread = std::thread(&Editor::aiWorker, this);
     }
 
     void runEditor() {
@@ -191,10 +221,10 @@ public:
                     _isSaveReady = false;
                 }
                 _currentFilePath = pathToSave;
-                if(_isDirty)
+                if(_isDirty) {
                     saveFile(); 
+                }
                 _change = true;
-                _isDirty = false;
             }
 
             if(_isFolderReady) {
@@ -226,7 +256,17 @@ public:
     }
 
     ~Editor() {
-        _rootFolder.reset(); 
+        _state = false;
+        _aiThreadRunning = false;
+        _aiCv.notify_all();
+        if (_aiThread.joinable()) {
+            _aiThread.join();
+        }
+
+        if (_rootFolder) {
+            delete _rootFolder;
+        }
+        clearSidebarItems();
         clearRenderLines();
         if (_textEngine) TTF_DestroyRendererTextEngine(_textEngine);
         if (_font) TTF_CloseFont(_font);
@@ -234,6 +274,7 @@ public:
         if (_window) SDL_DestroyWindow(_window);
         TTF_Quit();
         SDL_Quit();
+        llama_backend_free();
     }
 
 private:
@@ -243,6 +284,13 @@ private:
             if (rl.contentText) TTF_DestroyText(rl.contentText);
         }
         _renderLines.clear();
+    }
+
+    void clearSidebarItems() {
+        for (auto& item : _sidebarItems) {
+            if (item.textRender) TTF_DestroyText(item.textRender);
+        }
+        _sidebarItems.clear();
     }
 
     void processEvent(const SDL_Event& event) {
@@ -295,6 +343,224 @@ private:
         }
     }
 
+    void requestAiSuggestion() {
+        {
+            std::lock_guard<std::mutex> lock(_suggestionMutex);
+            _suggestionLines.clear();
+            _change = true;
+        }
+        
+        if (!_aiEnabled || _fileContent.empty()) return;
+
+        std::string prefix;
+        for (int i = 0; i < _cursorLine; ++i) {
+            prefix += _fileContent[i] + "\n";
+        }
+        prefix += _fileContent[_cursorLine].substr(0, _cursorCol);
+
+        std::string suffix = _fileContent[_cursorLine].substr(_cursorCol) + "\n";
+        for (int i = _cursorLine + 1; i < (int)_fileContent.size(); ++i) {
+            suffix += _fileContent[i] + "\n";
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(_aiWorkerMutex);
+            _aiPrefix = prefix;
+            _aiSuffix = suffix;
+            _aiReqLine = _cursorLine;
+            _aiReqCol = _cursorCol;
+            _cancelGeneration = true;
+            _pendingAiRequest = true;
+        }
+        _aiCv.notify_one();
+    }
+
+    void acceptAiSuggestion() {
+        std::unique_lock<std::mutex> lock(_suggestionMutex);
+        if (_suggestionLines.empty() || _sugCursorLine != _cursorLine || _sugCursorCol != _cursorCol) return;
+
+        std::string currentLine = _fileContent[_cursorLine];
+        std::string leftPart = currentLine.substr(0, _cursorCol);
+        std::string rightPart = currentLine.substr(_cursorCol);
+
+        if (_suggestionLines.size() == 1) {
+            _fileContent[_cursorLine].insert(_cursorCol, _suggestionLines[0]);
+            _cursorCol += _suggestionLines[0].length();
+            updateSingleRenderLine(_cursorLine);
+        } else {
+            _fileContent[_cursorLine] = leftPart + _suggestionLines[0];
+            std::vector<std::string> newLines;
+            for(size_t i = 1; i < _suggestionLines.size(); ++i) {
+                newLines.push_back(_suggestionLines[i]);
+            }
+            _cursorCol = newLines.back().length(); 
+            newLines.back() += rightPart; 
+            
+            _fileContent.insert(_fileContent.begin() + _cursorLine + 1, newLines.begin(), newLines.end());
+            _cursorLine += _suggestionLines.size() - 1;
+            
+            updateTextDisplay();
+        }
+
+        _suggestionLines.clear();
+        forceCursorVisible();
+        _change = true;
+        _isDirty = true;
+
+        lock.unlock(); 
+        
+        requestAiSuggestion();
+    }
+
+    void aiWorker() {
+        llama_model* model = nullptr;
+        
+        while (_aiThreadRunning) {
+            std::string prefix, suffix;
+            int reqLine = 0, reqCol = 0;
+            
+            {
+                std::unique_lock<std::mutex> lock(_aiWorkerMutex);
+                _aiCv.wait(lock, [this] { return _pendingAiRequest || !_aiThreadRunning; });
+                if (!_aiThreadRunning) break;
+
+                _pendingAiRequest = false;
+                _cancelGeneration = false;
+                prefix = _aiPrefix;
+                suffix = _aiSuffix;
+                reqLine = _aiReqLine;
+                reqCol = _aiReqCol;
+            }
+
+            if (!model) {
+                llama_model_params mparams = llama_model_default_params();
+                mparams.n_gpu_layers = 999; 
+                mparams.main_gpu = 0; 
+                mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+                
+                model = llama_model_load_from_file("qwen.gguf", mparams);
+                if (!model) {
+                    SDL_Log("Failed to load Qwen FIM model (qwen.gguf). Disabling AI.");
+                    _aiEnabled = false;
+                    continue;
+                }
+            }
+
+            llama_context_params cparams = llama_context_default_params();
+            
+            cparams.n_ctx = 8192; 
+            cparams.n_batch = 2048;
+            
+            llama_context* ctx = llama_init_from_model(model, cparams);
+            
+            if (!ctx) {
+                SDL_Log("Failed to initialize llama_context. Check your VRAM or reduce n_ctx.");
+                continue;
+            }
+
+            llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+
+            std::string prompt = "<|fim_prefix|>" + prefix + "<|fim_suffix|>" + suffix + "<|fim_middle|>";
+
+            const llama_vocab* vocab = llama_model_get_vocab(model);
+
+            std::vector<llama_token> tokens_list(prompt.size() + 16);
+            int n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
+            if (n_tokens < 0) {
+                tokens_list.resize(-n_tokens);
+                n_tokens = llama_tokenize(vocab, prompt.c_str(), prompt.size(), tokens_list.data(), tokens_list.size(), true, true);
+            }
+
+            if (n_tokens > cparams.n_ctx - 1024) {
+                SDL_Log("File is too large for the 8192 token context window. Suggestion skipped.");
+                llama_sampler_free(sampler);
+                llama_free(ctx);
+                continue;
+            }
+
+            llama_batch batch = llama_batch_init(cparams.n_batch, 0, 1);
+            bool decode_failed = false;
+            
+            for (int i = 0; i < n_tokens; i += cparams.n_batch) {
+                int eval_count = std::min((int)cparams.n_batch, n_tokens - i);
+                batch.n_tokens = eval_count;
+                
+                for (int j = 0; j < eval_count; j++) {
+                    batch.token[j] = tokens_list[i + j];
+                    batch.pos[j] = i + j;
+                    batch.n_seq_id[j] = 1;
+                    batch.seq_id[j][0] = 0;
+                    batch.logits[j] = false;
+                }
+                
+                if (i + eval_count == n_tokens) {
+                    batch.logits[eval_count - 1] = true;
+                }
+                
+                if (llama_decode(ctx, batch) != 0) {
+                    SDL_Log("llama_decode() failed during prompt evaluation");
+                    decode_failed = true;
+                    break;
+                }
+            }
+
+            if (decode_failed) {
+                llama_batch_free(batch);
+                llama_sampler_free(sampler);
+                llama_free(ctx);
+                continue;
+            }
+
+            std::vector<std::string> cur_suggestion_lines = {""};
+            int n_cur = n_tokens;
+            int max_gen = 2048; 
+
+            for (int i = 0; i < max_gen; ++i) {
+                if (_cancelGeneration) break;
+
+                llama_token new_token_id = llama_sampler_sample(sampler, ctx, -1);
+                llama_sampler_accept(sampler, new_token_id);
+
+                if (llama_vocab_is_eog(vocab, new_token_id)) break;
+
+                char buf[128];
+                int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
+                if (n > 0) {
+                    std::string piece(buf, n);
+                    for (char c : piece) {
+                        if (c == '\n') cur_suggestion_lines.push_back("");
+                        else if (c == '\r') continue;
+                        else cur_suggestion_lines.back() += c;
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(_suggestionMutex);
+                        _suggestionLines = cur_suggestion_lines;
+                        _sugCursorLine = reqLine;
+                        _sugCursorCol = reqCol;
+                        _change = true; 
+                    }
+                }
+
+                batch.token[0] = new_token_id;
+                batch.pos[0] = n_cur++;
+                batch.n_seq_id[0] = 1;
+                batch.seq_id[0][0] = 0;
+                batch.logits[0] = true;
+                batch.n_tokens = 1;
+
+                if (llama_decode(ctx, batch) != 0) break;
+            }
+            
+            llama_batch_free(batch);
+            llama_sampler_free(sampler);
+            llama_free(ctx);
+        }
+
+        if (model) llama_model_free(model);
+    }
+
     void handleTextInput(const char* text) {
         clearSelection();
         _fileContent[_cursorLine].insert(_cursorCol, text);
@@ -304,6 +570,8 @@ private:
         forceCursorVisible();
         _change = true;
         _isDirty = true;
+
+        requestAiSuggestion();
     }
 
     void handleKeyDown(const SDL_KeyboardEvent& key) {
@@ -311,6 +579,19 @@ private:
 
         if (key.key == SDLK_ESCAPE) {
             _state = false;
+        }
+        else if (ctrlPressed && key.key == SDLK_I) {
+            _aiEnabled = !_aiEnabled;
+            if (_aiEnabled) {
+                requestAiSuggestion();
+            } else {
+                std::lock_guard<std::mutex> lock(_suggestionMutex);
+                _suggestionLines.clear();
+                _change = true;
+            }
+        }
+        else if (ctrlPressed && key.key == SDLK_TAB) {
+            acceptAiSuggestion();
         }
         else if (ctrlPressed && key.key == SDLK_C) {
             copySelectionToClipboard();
@@ -320,7 +601,6 @@ private:
         }
         else if (ctrlPressed && key.key == SDLK_S) {
             saveFile();
-            _isDirty = false;
         }
         else if (ctrlPressed && key.key == SDLK_A){
             selectAllText();
@@ -343,6 +623,7 @@ private:
                 _cursorCol = _fileContent[_cursorLine].length();
             }
             forceCursorVisible();
+            requestAiSuggestion();
         }
         else if (key.key == SDLK_RIGHT) {
             clearSelection();
@@ -353,6 +634,7 @@ private:
                 _cursorCol = 0;
             }
             forceCursorVisible();
+            requestAiSuggestion();
         }
         else if (key.key == SDLK_UP) {
             clearSelection();
@@ -361,6 +643,7 @@ private:
                 _cursorCol = std::min(_cursorCol, (int)_fileContent[_cursorLine].length());
             }
             forceCursorVisible();
+            requestAiSuggestion();
         }
         else if (key.key == SDLK_DOWN) {
             clearSelection();
@@ -369,6 +652,7 @@ private:
                 _cursorCol = std::min(_cursorCol, (int)_fileContent[_cursorLine].length());
             }
             forceCursorVisible();
+            requestAiSuggestion();
         }
     }
 
@@ -381,6 +665,9 @@ private:
         updateSingleRenderLine(_cursorLine);
         forceCursorVisible();
         _change = true;
+        _isDirty = true;
+        
+        requestAiSuggestion();
     }
 
     void handleBackspace() {
@@ -404,6 +691,8 @@ private:
         forceCursorVisible();
         _change = true;
         _isDirty = true;
+        
+        requestAiSuggestion();
     }
 
     void handleEnter() {
@@ -422,6 +711,8 @@ private:
         forceCursorVisible();
         _change = true;
         _isDirty = true;
+        
+        requestAiSuggestion();
     }
 
     void handlePaste() {
@@ -467,9 +758,13 @@ private:
         forceCursorVisible();
         _change = true;
         _isDirty = true;
+        
+        requestAiSuggestion();
     }
 
     void saveFile() {
+        if (!_isDirty) return;
+
         if (_currentFilePath.empty()) {
             SDL_ShowSaveFileDialog(Editor::saveFileCallback, this, _window, nullptr, 0, nullptr);
             return;
@@ -482,6 +777,7 @@ private:
             }
             file.close();
             SDL_Log("Successfully saved to %s", _currentFilePath.c_str());
+            _isDirty = false; 
         }
     }
 
@@ -512,6 +808,10 @@ private:
 
     void clearSelection() {
         _selStartLine = _selEndLine = -1;
+        {
+            std::lock_guard<std::mutex> lock(_suggestionMutex);
+            _suggestionLines.clear();
+        }
     }
 
     void updateSingleRenderLine(int lineIdx) {
@@ -577,9 +877,7 @@ private:
                     return; 
                 }
                 else if(hb.name == "NewText") {
-                    if(_isDirty){
-                        saveFile();
-                    }
+                    if (_isDirty) saveFile();
                     _fileContent.clear();
                     _fileContent.push_back("");
                     _cursorLine = 0;
@@ -601,17 +899,15 @@ private:
             float relativeY = mouseY - (_sideBar.y + 5.0f) + _sideScrollOffsetY;
             int clickedIndex = (int)(relativeY / lineHeight);
 
-            if (clickedIndex >= 0 && clickedIndex < _visibleNodes.size()) {
-                FileNode* n = _visibleNodes[clickedIndex];
-                if (n->isDirectory) {
-                    n->isExpanded = !n->isExpanded;
-                    if (n->isExpanded && !n->isLoaded) {
-                        loadDirectoryContents(n);
-                    }
-                    updateNodeText(n);
+            if (clickedIndex >= 0 && clickedIndex < _sidebarItems.size()) {
+                SideBarItem& clickedItem = _sidebarItems[clickedIndex];
+                
+                if (clickedItem.isFolder && clickedItem.folderPtr) {
+                    clickedItem.folderPtr->isExpanded = !clickedItem.folderPtr->isExpanded;
                     updateFolderView();
                 } else {
-                    processFileLoad(n->path);
+                    if (_isDirty) saveFile();
+                    processFileLoad(clickedItem.path);
                 }
                 _change = true;
             }
@@ -629,6 +925,8 @@ private:
             _selEndLine = _selStartLine;
             _selEndCol = _selStartCol;
             _change = true;
+            
+            requestAiSuggestion();
         } else {
             clearSelection();
             _change = true;
@@ -777,16 +1075,14 @@ private:
         clampSideScrollbars();
     }
 
-    void loadDirectoryContents(FileNode* node) {
-        if (!node || !node->isDirectory) return;
-        node->children.clear();
+    void loadFolderContentsRecursive(Folder* folder) {
+        if (!folder) return;
+        folder->childFolders.clear();
+        folder->files.clear();
 
-        EnumData data;
-        if (!SDL_EnumerateDirectory(node->path.c_str(), DirEnumCallback, &data)) {
-            SDL_Log("FS error: %s", SDL_GetError());
-        }
+        SDL_EnumerateDirectory(folder->path.c_str(), DirEnumCallback, folder);
 
-        auto sortFunc = [](const std::unique_ptr<FileNode>& a, const std::unique_ptr<FileNode>& b) {
+        auto sortFolders = [](Folder* a, Folder* b) {
             std::string nameA = a->name;
             std::string nameB = b->name;
             for(auto& c : nameA) c = std::tolower(static_cast<unsigned char>(c));
@@ -794,65 +1090,83 @@ private:
             return nameA < nameB;
         };
 
-        std::sort(data.dirs.begin(), data.dirs.end(), sortFunc);
-        std::sort(data.files.begin(), data.files.end(), sortFunc);
-        
-        for(auto& d : data.dirs) node->children.push_back(std::move(d));
-        for(auto& f : data.files) node->children.push_back(std::move(f));
-        
-        node->isLoaded = true;
+        auto sortFiles = [](const std::string& a, const std::string& b) {
+            std::string nameA = a;
+            std::string nameB = b;
+            for(auto& c : nameA) c = std::tolower(static_cast<unsigned char>(c));
+            for(auto& c : nameB) c = std::tolower(static_cast<unsigned char>(c));
+            return nameA < nameB;
+        };
+
+        std::sort(folder->childFolders.begin(), folder->childFolders.end(), sortFolders);
+        std::sort(folder->files.begin(), folder->files.end(), sortFiles);
+
+        for (Folder* child : folder->childFolders) {
+            loadFolderContentsRecursive(child);
+        }
     }
 
-    void updateNodeText(FileNode* n) {
-        if (n->textRender) {
-            TTF_DestroyText(n->textRender);
-            n->textRender = nullptr;
-        }
-        std::string prefix = n->isDirectory ? (n->isExpanded ? "v " : "> ") : "  ";
-        std::string displayText = prefix + n->name;
+    void buildSidebarView(Folder* folder, int depth) {
+        if (!folder) return;
         
-        n->textRender = TTF_CreateText(_textEngine, _font, displayText.c_str(), displayText.length());
-        if (n->textRender) {
-            TTF_GetTextSize(n->textRender, &n->w, &n->h);
-            if (n->isDirectory) {
-                TTF_SetTextColor(n->textRender, 100, 200, 255, 255);  
-            } else {
-                TTF_SetTextColor(n->textRender, 200, 200, 200, 255); 
+        SideBarItem item;
+        item.isFolder = true;
+        item.folderPtr = folder;
+        item.name = folder->name;
+        item.path = folder->path;
+        item.depth = depth;
+        item.textRender = nullptr;
+        _sidebarItems.push_back(item);
+
+        if (folder->isExpanded) {
+            for (Folder* child : folder->childFolders) {
+                buildSidebarView(child, depth + 1);
             }
-        }
-    }
-
-    void flattenTree(FileNode* node, int depth) {
-        if (!node) return;
-        _visibleNodes.push_back(node);
-        _visibleNodeDepths.push_back(depth);
-        if (node->isExpanded) {
-            for (auto& child : node->children) {
-                flattenTree(child.get(), depth + 1);
+            for (const std::string& file : folder->files) {
+                SideBarItem fItem;
+                fItem.isFolder = false;
+                fItem.folderPtr = nullptr;
+                fItem.name = file;
+                
+                std::string dir = folder->path;
+                if (!dir.empty() && dir.back() != '/' && dir.back() != '\\') dir += "/";
+                
+                fItem.path = dir + file;
+                fItem.depth = depth + 1;
+                fItem.textRender = nullptr;
+                _sidebarItems.push_back(fItem);
             }
         }
     }
 
     void updateFolderView() {
-        _visibleNodes.clear();
-        _visibleNodeDepths.clear();
+        clearSidebarItems();
         
         if (_rootFolder) {
-            flattenTree(_rootFolder.get(), 0);
+            buildSidebarView(_rootFolder, 0);
         }
         
         int lineHeight = TTF_GetFontHeight(_font);
         if (lineHeight <= 0) lineHeight = 24;
         
-        _sideTextHeight = _visibleNodes.size() * lineHeight;
+        _sideTextHeight = _sidebarItems.size() * lineHeight;
         _sideTextWidth = 0;
         
-        for (size_t i = 0; i < _visibleNodes.size(); i++) {
-            FileNode* n = _visibleNodes[i];
-            if (!n->textRender) {
-                updateNodeText(n);
+        for (auto& item : _sidebarItems) {
+            std::string prefix = item.isFolder ? (item.folderPtr->isExpanded ? "v " : "> ") : "  ";
+            std::string displayText = prefix + item.name;
+            
+            item.textRender = TTF_CreateText(_textEngine, _font, displayText.c_str(), displayText.length());
+            if (item.textRender) {
+                TTF_GetTextSize(item.textRender, &item.w, &item.h);
+                if (item.isFolder) {
+                    TTF_SetTextColor(item.textRender, 100, 200, 255, 255);  
+                } else {
+                    TTF_SetTextColor(item.textRender, 200, 200, 200, 255); 
+                }
             }
-            int itemW = n->w + (_visibleNodeDepths[i] * 15) + 20;
+
+            int itemW = item.w + (item.depth * 15) + 20;
             if (itemW > _sideTextWidth) {
                 _sideTextWidth = itemW;
             }
@@ -862,7 +1176,12 @@ private:
 
     void processFolderLoad(const std::string& folderPath) {
         _currentFolderPath = folderPath;
-        _rootFolder = std::make_unique<FileNode>();
+        if (_rootFolder) {
+            delete _rootFolder;
+            _rootFolder = nullptr;
+        }
+        
+        _rootFolder = new Folder();
         _rootFolder->path = folderPath;
         
         std::string cleanPath = folderPath;
@@ -877,10 +1196,9 @@ private:
             _rootFolder->name = cleanPath.empty() ? folderPath : cleanPath; 
         }
         
-        _rootFolder->isDirectory = true;
         _rootFolder->isExpanded = true;
         
-        loadDirectoryContents(_rootFolder.get());
+        loadFolderContentsRecursive(_rootFolder);
         updateFolderView();
         
         _fileContent.clear();
@@ -894,6 +1212,7 @@ private:
         _sideScrollOffsetX = 0.0f;
         _sideScrollOffsetY = 0.0f;
         _change = true;
+        _isDirty = false;
     }
 
     void updateHitboxes() {
@@ -962,6 +1281,14 @@ private:
             TTF_DrawRendererText(fileOptions, _hitBoxes[2].box.x, 0);
             TTF_DestroyText(fileOptions);
         }
+
+        std::string aiStatus = _aiEnabled ? "AI: ON" : "AI: OFF";
+        TTF_Text* aiOptions = TTF_CreateText(_textEngine, _font, aiStatus.c_str(), aiStatus.length());
+        if (aiOptions) {
+            TTF_SetTextColor(aiOptions, _aiEnabled ? 0 : 255, _aiEnabled ? 255 : 0, 0, 255);
+            TTF_DrawRendererText(aiOptions, _hitBoxes[2].box.x + _hitBoxes[2].box.w + 30, 0);
+            TTF_DestroyText(aiOptions);
+        }
     }
 
     void drawSideBar() {
@@ -971,7 +1298,7 @@ private:
         float displayW = _sideBar.w - SCROLLBAR_SIZE;
         float displayH = _sideBar.h - SCROLLBAR_SIZE;
 
-        if (!_visibleNodes.empty()) {
+        if (!_sidebarItems.empty()) {
             SDL_Rect clipRect = {
                 (int)_sideBar.x,
                 (int)_sideBar.y,
@@ -985,14 +1312,14 @@ private:
 
             int firstVisibleLine = std::max(0, (int)(_sideScrollOffsetY / lineHeight));
             int visibleLineCount = std::ceil(clipRect.h / (float)lineHeight) + 1;
-            int lastVisibleLine = std::min((int)_visibleNodes.size(), firstVisibleLine + visibleLineCount);
+            int lastVisibleLine = std::min((int)_sidebarItems.size(), firstVisibleLine + visibleLineCount);
 
             for (int i = firstVisibleLine; i < lastVisibleLine; ++i) {
                 float yPos = _sideBar.y + 5.0f - _sideScrollOffsetY + (i * lineHeight);
-                float xPos = _sideBar.x + 5.0f - _sideScrollOffsetX + (_visibleNodeDepths[i] * 15.0f);
+                float xPos = _sideBar.x + 5.0f - _sideScrollOffsetX + (_sidebarItems[i].depth * 15.0f);
 
-                if (_visibleNodes[i]->textRender) {
-                    TTF_DrawRendererText(_visibleNodes[i]->textRender, xPos, yPos);
+                if (_sidebarItems[i].textRender) {
+                    TTF_DrawRendererText(_sidebarItems[i].textRender, xPos, yPos);
                 }
             }
             SDL_SetRenderClipRect(_renderer, nullptr);
@@ -1033,22 +1360,37 @@ private:
         int lineHeight = TTF_GetFontHeight(_font);
         if (lineHeight <= 0) lineHeight = 24;
 
+        std::vector<std::string> currentSuggestions;
+        int sugLine = -1, sugCol = -1;
+        {
+            std::lock_guard<std::mutex> lock(_suggestionMutex);
+            currentSuggestions = _suggestionLines;
+            sugLine = _sugCursorLine;
+            sugCol = _sugCursorCol;
+        }
+
+        int sL = _selStartLine, sC = _selStartCol;
+        int eL = _selEndLine, eC = _selEndCol;
+        bool hasSelection = (sL != -1 && eL != -1) && (sL != eL || sC != eC);
+        if (hasSelection && (sL > eL || (sL == eL && sC > eC))) {
+            std::swap(sL, eL);
+            std::swap(sC, eC);
+        }
+
+        bool showSuggestion = _aiEnabled && !currentSuggestions.empty() && 
+                              _cursorLine == sugLine && _cursorCol == sugCol && !hasSelection;
+        int numSugLines = showSuggestion ? currentSuggestions.size() : 0;
+
         if (!_renderLines.empty()) {
-            int firstVisibleLine = std::max(0, (int)(_scrollOffsetY / lineHeight));
-            int visibleLineCount = std::ceil(clipRect.h / (float)lineHeight) + 1;
-            int lastVisibleLine = std::min((int)_renderLines.size(), firstVisibleLine + visibleLineCount);
+            int startIdx = std::max(0, (int)(_scrollOffsetY / lineHeight) - (showSuggestion ? numSugLines : 0));
+            int endIdx = std::min((int)_renderLines.size(), startIdx + (int)std::ceil(clipRect.h / (float)lineHeight) + (showSuggestion ? numSugLines : 0) + 1);
 
-            int sL = _selStartLine, sC = _selStartCol;
-            int eL = _selEndLine, eC = _selEndCol;
-            
-            bool hasSelection = (sL != -1 && eL != -1) && (sL != eL || sC != eC);
-            if (hasSelection && (sL > eL || (sL == eL && sC > eC))) {
-                std::swap(sL, eL);
-                std::swap(sC, eC);
-            }
+            for (int i = startIdx; i < endIdx; ++i) {
+                int shift = (showSuggestion && i > _cursorLine) ? (numSugLines - 1) : 0;
+                float yPos = _textArea.y + 5.0f - _scrollOffsetY + (i + shift) * lineHeight;
 
-            for (int i = firstVisibleLine; i < lastVisibleLine; ++i) {
-                float yPos = _textArea.y + 5.0f - _scrollOffsetY + (i * lineHeight);
+                if (yPos > _textArea.y + _textArea.h) continue;
+                if (yPos + (showSuggestion && i == _cursorLine ? numSugLines * lineHeight : lineHeight) < _textArea.y) continue;
 
                 if (hasSelection && i >= sL && i <= eL) {
                     int col1 = (i == sL) ? sC : 0;
@@ -1084,6 +1426,25 @@ private:
                     
                     SDL_SetRenderDrawColor(_renderer, 0, 236, 234, 255);
                     SDL_RenderFillRect(_renderer, &cursorRect);
+
+                    if (showSuggestion) {
+                        for (size_t j = 0; j < currentSuggestions.size(); ++j) {
+                            if (currentSuggestions[j].empty()) continue;
+
+                            float sugY = yPos + (j * lineHeight);
+                            float sugX = _textArea.x + 5.0f - _scrollOffsetX + _renderLines[i].numW;
+                            if (j == 0) {
+                                sugX += (_cursorCol * _charWidth); 
+                            }
+
+                            TTF_Text* sText = TTF_CreateText(_textEngine, _font, currentSuggestions[j].c_str(), currentSuggestions[j].length());
+                            if (sText) {
+                                TTF_SetTextColor(sText, 150, 150, 150, 255);
+                                TTF_DrawRendererText(sText, sugX, sugY);
+                                TTF_DestroyText(sText);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1147,6 +1508,9 @@ private:
         _scrollOffsetY = 0.0f;
 
         updateTextDisplay();
+        
+        _isDirty = false;
+        requestAiSuggestion();
     }
 
     void updateTextDisplay() {
@@ -1293,34 +1657,35 @@ private:
         editor->_isFolderReady = true;
     }
 
-static SDL_EnumerationResult SDLCALL DirEnumCallback(void *userdata, const char *dirname, const char *fname) {
-    EnumData* data = static_cast<EnumData*>(userdata);
+    static SDL_EnumerationResult SDLCALL DirEnumCallback(void *userdata, const char *dirname, const char *fname) {
+        Folder* parentFolder = static_cast<Folder*>(userdata);
 
-    std::string fileName = fname;
-    if (fileName == "." || fileName == "..") {
+        std::string fileName = fname;
+        if (fileName == "." || fileName == "..") {
+            return SDL_ENUM_CONTINUE;
+        }
+
+        std::string dirStr = dirname;
+        if (!dirStr.empty() && dirStr.back() != '/' && dirStr.back() != '\\') {
+            dirStr += "/";
+        }
+        
+        std::string fullPath = dirStr + fname;
+        SDL_PathInfo info;
+        
+        if (SDL_GetPathInfo(fullPath.c_str(), &info)) {
+            if (info.type == SDL_PATHTYPE_DIRECTORY) {
+                Folder* child = new Folder();
+                child->path = fullPath;
+                child->name = fileName;
+                child->isExpanded = false;
+                parentFolder->childFolders.push_back(child);
+            } else {
+                parentFolder->files.push_back(fileName);
+            }
+        }
         return SDL_ENUM_CONTINUE;
     }
-
-    auto child = std::make_unique<FileNode>();
-
-    child->path = std::string(dirname) + fname;
-    child->name = fileName;
-    
-    SDL_PathInfo info;
-    if (SDL_GetPathInfo(child->path.c_str(), &info)) {
-        child->isDirectory = (info.type == SDL_PATHTYPE_DIRECTORY);
-    } else {
-        child->isDirectory = false;
-    }
-
-    if (child->isDirectory) {
-        data->dirs.push_back(std::move(child));
-    } else {
-        data->files.push_back(std::move(child));
-    }
-
-    return SDL_ENUM_CONTINUE;
-}
 };
 
 int main(int argc, char* argv[]) {
